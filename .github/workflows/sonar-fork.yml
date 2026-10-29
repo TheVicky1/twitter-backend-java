@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout trusted base
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7 # NOSONAR: only the trusted default branch is checked out here; the PR revision is validated before the later checkout
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
