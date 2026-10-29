@@ -1,0 +1,198 @@
+#
+# Twitter Backend - Moo: Twitter Clone Application Backend by Scaler
+# Copyright © 2021-2026 Subhrodip Mohanta (hello@subho.xyz)
+#
+
+name: SonarQube PR Analysis
+
+on:
+  workflow_run:
+    workflows: [PR Checker]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  sonar:
+    name: SonarQube Analysis (PR)
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          path: _sonar-safe
+      - name: Download untrusted Sonar inputs
+        uses: actions/download-artifact@v8
+        with:
+          name: pr-sonar-input
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: _sonar-input
+      - name: Resolve pull request metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          revision="$(cat _sonar-input/sonar-revision.txt)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Artifact revision is not a commit SHA" >&2
+            exit 1
+          fi
+          head_owner="${HEAD_REPOSITORY%%/*}"
+          pr_json="$(
+            gh api --method GET "repos/$REPOSITORY/pulls" \
+              -f state=all \
+              -f head="$head_owner:$HEAD_BRANCH" \
+              -f base="$BASE_BRANCH" | \
+              jq -c --arg head_repo "$HEAD_REPOSITORY" --arg merge_sha "$revision" '
+                map(select(.head.repo.full_name == $head_repo and .merge_commit_sha == $merge_sha)) as $exact |
+                if ($exact | length) == 1 then $exact[0]
+                else empty end
+              '
+          )"
+          if [[ -z "$pr_json" ]]; then
+            echo "Could not resolve one pull request for $HEAD_REPOSITORY:$HEAD_BRANCH" >&2
+            exit 1
+          fi
+          jq -r '.number' <<< "$pr_json" | sed 's/^/number=/' >> "$GITHUB_OUTPUT"
+          jq -r '.head.sha' <<< "$pr_json" | sed 's/^/head_sha=/' >> "$GITHUB_OUTPUT"
+          jq -r '.head.ref' <<< "$pr_json" | sed 's/^/head_ref=/' >> "$GITHUB_OUTPUT"
+          jq -r '.base.ref' <<< "$pr_json" | sed 's/^/base_ref=/' >> "$GITHUB_OUTPUT"
+          # Bind the artifact revision to the API-resolved PR.
+          head_sha="$(jq -r '.head.sha' <<< "$pr_json")"
+          pr_number="$(jq -r '.number' <<< "$pr_json")"
+          git -C _sonar-safe fetch origin "refs/pull/$pr_number/merge"
+          if [[ "$(git -C _sonar-safe rev-parse FETCH_HEAD)" != "$revision" ]] || \
+             [[ "$(git -C _sonar-safe rev-parse FETCH_HEAD^2)" != "$head_sha" ]]; then
+            echo "PR changed while resolving the analyzed revision" >&2
+            exit 1
+          fi
+          # Use the validated merge tree for both Git metadata and source files.
+          git -C _sonar-safe checkout --detach "$revision"
+          if find _sonar-safe/src/main/java _sonar-safe/src/test/java -type l -print -quit | grep -q .; then
+            echo "Refusing symlink in PR source" >&2
+            exit 1
+          fi
+          rm -f _sonar-safe/sonar-project.properties
+          echo "merge_sha=$revision" >> "$GITHUB_OUTPUT"
+      - name: Mark Sonar status pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ steps.pr.outputs.merge_sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST "repos/$REPOSITORY/statuses/$COMMIT_SHA" \
+            -f state=pending \
+            -f context="SonarQube Analysis" \
+            -f description="SonarQube analysis is running for this fork PR" \
+            -f target_url="$TARGET_URL"
+      - name: Stage safe Sonar inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          source = Path("_sonar-input").resolve()
+          destination = Path("_sonar-safe").resolve()
+          for relative in (Path("target"),):
+              path = destination / relative
+              if path.is_symlink():
+                  raise SystemExit(f"Refusing symlink in trusted checkout: {path}")
+              if path.is_dir():
+                  shutil.rmtree(path)
+              elif path.exists():
+                  path.unlink()
+          allowed = (
+              Path("target/classes"),
+              Path("target/test-classes"),
+              Path("target/sonar-libraries"),
+              Path("target/site/jacoco/jacoco.xml"),
+              Path("target/surefire-reports"),
+          )
+
+          def copy_file(path: Path) -> None:
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"Refusing unsafe artifact entry: {path}")
+              relative = path.relative_to(source)
+              target = destination / relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(path, target)
+
+          for relative in allowed:
+              path = source / relative
+              if not path.exists() or path.is_symlink():
+                  raise SystemExit(f"Missing or unsafe artifact entry: {path}")
+              if path.is_file():
+                  copy_file(path)
+              else:
+                  for entry in path.rglob("*"):
+                      if entry.is_symlink():
+                          raise SystemExit(f"Refusing symlink in artifact: {entry}")
+                      if entry.is_file():
+                          copy_file(entry)
+          PY
+      - name: Run SonarQube analysis
+        id: sonar
+        if: steps.pr.outcome == 'success'
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        with:
+          projectBaseDir: _sonar-safe
+          args: >-
+            -Dsonar.projectKey=ohbus_twitter-backend-java
+            -Dsonar.organization=ohbus
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.pullrequest.key=${{ steps.pr.outputs.number }}
+            -Dsonar.pullrequest.branch=${{ steps.pr.outputs.head_ref }}
+            -Dsonar.pullrequest.base=${{ steps.pr.outputs.base_ref }}
+            -Dsonar.sources=src/main/java
+            -Dsonar.tests=src/test/java
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.java.test.binaries=target/test-classes
+            -Dsonar.java.libraries=target/sonar-libraries/**/*.jar
+            -Dsonar.java.test.libraries=target/sonar-libraries/**/*.jar
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+            -Dsonar.qualitygate.wait=true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Publish Sonar status
+        if: always() && steps.pr.outputs.merge_sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ steps.pr.outputs.merge_sha }}
+          PR_OUTCOME: ${{ steps.pr.outcome }}
+          SONAR_OUTCOME: ${{ steps.sonar.outcome }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ "$PR_OUTCOME" == "success" && "$SONAR_OUTCOME" == "success" ]]; then
+            state=success
+            description="SonarQube analysis passed"
+          else
+            state=failure
+            description="SonarQube analysis failed"
+          fi
+          gh api --method POST "repos/$REPOSITORY/statuses/$COMMIT_SHA" \
+            -f state="$state" \
+            -f context="SonarQube Analysis" \
+            -f description="$description" \
+            -f target_url="$TARGET_URL"
+      - name: Fail when Sonar analysis fails
+        if: steps.pr.outcome != 'success' || steps.sonar.outcome != 'success'
+        run: exit 1

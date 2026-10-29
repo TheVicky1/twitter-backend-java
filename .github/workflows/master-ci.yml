@@ -91,7 +91,50 @@ jobs:
           path: .mvn/wrapper
           key: ${{ runner.os }}-maven-wrapper-${{ hashFiles('**/maven-wrapper.properties') }}
       - name: Run Maven Verify
-        run: ./mvnw -B test
+        run: ./mvnw -B clean verify
+      - name: Upload Sonar inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: master-sonar-input
+          path: |
+            target/classes/
+            target/test-classes/
+            target/site/jacoco/jacoco.xml
+            target/surefire-reports/
+          if-no-files-found: error
+          retention-days: 1
+
+  sonar:
+    name: SonarQube Analysis
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up Microsoft JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'microsoft'
+          java-version: '25'
+          cache: 'maven'
+      - name: Cache Maven Wrapper
+        uses: actions/cache@v6
+        with:
+          path: .mvn/wrapper
+          key: ${{ runner.os }}-maven-wrapper-${{ hashFiles('**/maven-wrapper.properties') }}
+      - name: Download Sonar inputs
+        uses: actions/download-artifact@v8
+        with:
+          name: master-sonar-input
+          path: target/
+      - name: Run SonarQube analysis
+        run: ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.8.0.7211:sonar -Dsonar.qualitygate.wait=true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
   security:
     name: Security Scan (CodeQL)
@@ -125,7 +168,7 @@ jobs:
 
   distribution:
     name: Publish Images
-    needs: [test, security]
+    needs: [test, security, sonar]
     runs-on: ubuntu-latest
     permissions:
       contents: read

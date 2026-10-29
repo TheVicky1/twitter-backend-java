@@ -35,6 +35,8 @@ jobs:
         with:
           path: ~/.spotless
           key: ${{ runner.os }}-spotless-${{ hashFiles('**/pom.xml') }}
+      - name: Check fork analysis revision guard
+        run: python3 .github/tests/test_sonar_revision.py
       - name: Run Spotless Check
         run: ./mvnw spotless:check
 
@@ -55,13 +57,30 @@ jobs:
         with:
           path: .mvn/wrapper
           key: ${{ runner.os }}-maven-wrapper-${{ hashFiles('**/maven-wrapper.properties') }}
+      - name: Record analyzed revision
+        run: git rev-parse HEAD > sonar-revision.txt
       - name: Run Maven Verify
         run: ./mvnw -B clean verify
+      - name: Prepare Sonar libraries
+        run: ./mvnw -B dependency:copy-dependencies -DincludeScope=test -DoutputDirectory=target/sonar-libraries
       - name: Upload JAR artifact
         uses: actions/upload-artifact@v7
         with:
           name: pr-binary
           path: target/*.jar
+          retention-days: 1
+      - name: Upload Sonar inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-sonar-input
+          path: |
+            sonar-revision.txt
+            target/classes/
+            target/test-classes/
+            target/sonar-libraries/
+            target/site/jacoco/jacoco.xml
+            target/surefire-reports/
+          if-no-files-found: error
           retention-days: 1
 
   docker-smoke:
